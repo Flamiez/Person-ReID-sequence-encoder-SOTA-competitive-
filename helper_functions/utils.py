@@ -11,22 +11,23 @@ import cv2
 import matplotlib.pyplot as plt
 
 class PersonReIDDataset(Dataset):
-    def __init__(self, root_dir, transform=None, is_training=True, max_frame_gap=50, min_seq_len=2):
+    def __init__(self, root_dir, transform=None, is_training=True, max_frame_gap=50, min_seq_len=2,
+                 keep_distractors=False):
         self.root_dir = root_dir
         self.is_training = is_training
         self.parsed_images = []
         self.max_frame_gap = max_frame_gap
         self.min_seq_len = min_seq_len
+        self.keep_distractors = keep_distractors
         self.sequences_by_person = {}
-        
-        # Filename example 0005_c4s1_002993_01.jpg
+
 
         for filename in os.listdir(root_dir):
             if filename.endswith(('.jpg', '.jpeg', '.png')):
                 parts = filename.split(sep="_")
 
                 person_id = int(parts[0])
-                if person_id == -1:
+                if person_id == -1 and not keep_distractors:
                     continue
                 parsed_image = ParsedImage(image_path=os.path.join(root_dir, filename),
                                            person_id=person_id,
@@ -179,25 +180,13 @@ class Market1501Dataset(Dataset):
         return image, label
 
 class SequenceReIDDataset(Dataset):
-    """
-    Each sample is one complete temporal sequence (variable length).
-    Built on top of PersonReIDDataset's sequence-splitting logic.
-
-    Returns per sample:
-        images:    (T, C, H, W)  float tensor
-        length:    int            number of frames
-        person_id: int
-        camera_id: str
-    """
     def __init__(self, root_dir, transform=None, max_seq_len=None, max_frame_gap=50):
         self.max_seq_len = max_seq_len
 
-        # Reuse existing parsing + sequence-splitting logic
         _base = PersonReIDDataset(root_dir, transform=transform,
                                   max_frame_gap=max_frame_gap)
         self.transform = _base.transform
 
-        # Flatten sequences_by_person → list of sequences
         self.sequences = []
         for pid, cams in _base.sequences_by_person.items():
             for cam, seqs in cams.items():
@@ -218,7 +207,7 @@ class SequenceReIDDataset(Dataset):
             frames.append(self.transform(img))
 
         return {
-            'images': torch.stack(frames),   # (T, C, H, W)
+            'images': torch.stack(frames),
             'length': len(frames),
             'person_id': seq[0].person_id,
             'camera_id': seq[0].camera_id,
@@ -226,7 +215,6 @@ class SequenceReIDDataset(Dataset):
 
 
 def sequence_collate_fn(batch):
-    """Collate variable-length sequences by zero-padding to the longest in the batch."""
     lengths = torch.tensor([item['length'] for item in batch], dtype=torch.long)
     max_len = lengths.max().item()
 
@@ -237,8 +225,8 @@ def sequence_collate_fn(batch):
         padded[i, :t] = item['images']
 
     return {
-        'images': padded,                                                      # (B, T_max, C, H, W)
-        'lengths': lengths,                                                    # (B,)
+        'images': padded,
+        'lengths': lengths,
         'person_id': torch.tensor([item['person_id'] for item in batch]),
         'camera_id': [item['camera_id'] for item in batch],
     }
@@ -330,19 +318,6 @@ def get_image_mask(image, model):
 
 
 def detect_and_crop(pil_image, detector, conf_thresh=0.4, padding=0.05):
-    """
-    Run YOLOv8 person detection on a PIL image and return the highest-confidence
-    person crop. Falls back to the original image if no person is detected.
-
-    Args:
-        pil_image  : PIL.Image (RGB)
-        detector   : ultralytics YOLO model
-        conf_thresh: minimum detection confidence
-        padding    : fractional padding added around the bounding box
-
-    Returns:
-        PIL.Image: cropped person region, or the original image as fallback
-    """
     img_np = np.array(pil_image)
     results = detector(img_np, verbose=False)
     boxes = results[0].boxes
@@ -365,38 +340,15 @@ def detect_and_crop(pil_image, detector, conf_thresh=0.4, padding=0.05):
             y2 = min(float(h), y2 + pad_y)
             return pil_image.crop((x1, y1, x2, y2))
 
-    return pil_image  # fallback: full frame
+    return pil_image
 
 
 class MARSDataset:
-    """
-    Loads the MARS video ReID dataset.
-
-    MARS structure:
-        bounding_box_train/{pid}/{pid}C{cam}T{tracklet}F{frame}.jpg
-        bounding_box_test/{pid}/  (includes '00-1' distractors and '0000' background — skipped)
-
-    Filename format: 0001C1T0001F001.jpg
-        pid      = first 4 chars
-        cam      = char after 'C' (single digit)
-        tracklet = 4 chars after 'T'
-        frame    = 3 chars after 'F'
-
-    Produces the same sequences_by_person dict as PersonReIDDataset:
-        {pid: {cam_id: [[ParsedImage, ...], ...]}}
-    so the entire training/eval pipeline works unchanged.
-
-    Args:
-        root_dir    : path to bounding_box_train or bounding_box_test
-        min_seq_len : discard tracklets shorter than this (default 2)
-    """
     def __init__(self, root_dir, min_seq_len=2):
         self.root_dir  = root_dir
         self.sequences_by_person = {}
 
-        # Each person has its own subdirectory
         for pid_str in sorted(os.listdir(root_dir)):
-            # Skip distractors (00-1) and background (0000)
             if pid_str in ('00-1', '0000'):
                 continue
             pid_dir = os.path.join(root_dir, pid_str)
@@ -408,13 +360,11 @@ class MARSDataset:
             except ValueError:
                 continue
 
-            # Group frames by (cam, tracklet)
-            tracklets = {}   # (cam, tracklet) -> [ParsedImage]
+            tracklets = {}
             for fname in sorted(os.listdir(pid_dir)):
                 if not fname.lower().endswith('.jpg'):
                     continue
                 try:
-                    # e.g. 0001C1T0001F001.jpg
                     c_idx  = fname.index('C')
                     t_idx  = fname.index('T')
                     f_idx  = fname.index('F')
@@ -444,21 +394,6 @@ class MARSDataset:
 
 
 class DetectionCropTransform:
-    """
-    Drop-in transform that detects and crops the dominant person before any
-    other transforms run.  Place it first in a transforms.Compose pipeline
-    when working with full-frame images (e.g. IUSTPersonReID).
-
-    Example::
-
-        transform = transforms.Compose([
-            DetectionCropTransform(yolo_model),
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225]),
-        ])
-    """
     def __init__(self, detector, conf_thresh=0.4, padding=0.05):
         self.detector   = detector
         self.conf_thresh = conf_thresh
@@ -471,7 +406,6 @@ class DetectionCropTransform:
 
 
 
-# Find person in images sequence and then rank them based by most recent sequences found, If many sequences which are found lets say when using 4 consecutive images, sort them by most recent ones and by similarity assigning weights of importance to both
 
 
 

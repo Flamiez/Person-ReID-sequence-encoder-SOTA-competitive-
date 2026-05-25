@@ -24,43 +24,31 @@ class ImprovedSequenceEncoder(nn.Module):
     def __init__(self, rnn_hidden=512, embedding_dim=512, dropout=0.3):
         super().__init__()
 
-        # DINOv2-B/14: self-supervised ViT trained on 142M images.
-        # patch grid: (256/14) × (128/14) ≈ 18 × 9 patch tokens (timm interpolates).
         self.vit = timm.create_model(
             'vit_base_patch14_dinov2.lvd142m',
             pretrained=True,
             img_size=(256, 128),
             num_classes=0,
         )
-        self.patch_h = 256 // 14   # 18 patch rows
-        self.patch_w = 128 // 14   # 9  patch cols
+        self.patch_h = 256 // 14
+        self.patch_w = 128 // 14
         vit_dim = 768
 
-        # All blocks trainable — layer-wise LR decay applied in the optimizer.
         for param in self.vit.parameters():
             param.requires_grad = True
 
-        # Recompute activations during backward instead of storing them (~40% VRAM saved)
         self.vit.set_grad_checkpointing(enable=True)
 
-        # Global projection
-        self.global_proj  = nn.Linear(vit_dim, rnn_hidden)          # 768 → 512
+        self.global_proj  = nn.Linear(vit_dim, rnn_hidden)
 
-        # Multi-granularity local projectors — dims sum to rnn_hidden per granularity:
-        #   2 stripes × (rnn_hidden//2=256) = 512
-        #   4 stripes × (rnn_hidden//4=128) = 512
-        #   8 stripes × (rnn_hidden//8=64)  = 512
-        # combined_dim = 512 + 512 + 512 + 512 = rnn_hidden * 4 = 2048
         self.local_proj_2 = nn.Linear(vit_dim, rnn_hidden // 2)
         self.local_proj_4 = nn.Linear(vit_dim, rnn_hidden // 4)
         self.local_proj_8 = nn.Linear(vit_dim, rnn_hidden // 8)
 
-        combined_dim = rnn_hidden * 4   # 2048
+        combined_dim = rnn_hidden * 4
 
-        # Temporal Transformer over the per-frame combined features
         self.temporal_tf = TemporalTransformer(combined_dim)
 
-        # Bidirectional GRU
         self.rnn = nn.GRU(
             input_size=combined_dim,
             hidden_size=rnn_hidden,
@@ -70,10 +58,8 @@ class ImprovedSequenceEncoder(nn.Module):
             dropout=dropout
         )
 
-        # Attention pooling over time steps
         self.attention = TemporalAttention(rnn_hidden * 2)
 
-        # Final embedding head
         self.embed_head = nn.Sequential(
             nn.Linear(rnn_hidden * 2, embedding_dim),
             nn.BatchNorm1d(embedding_dim)
@@ -83,74 +69,61 @@ class ImprovedSequenceEncoder(nn.Module):
         B, T, C, H, W = x.shape
         frames = x.view(B * T, C, H, W)
 
-        # ViT forward — CLS token at index 0, patch tokens at 1:
         tokens       = self.vit.forward_features(frames)
-        cls_token    = tokens[:, 0]                        # (B*T, 768)
-        patch_tokens = tokens[:, 1:]                       # (B*T, 162, 768)
+        cls_token    = tokens[:, 0]
+        patch_tokens = tokens[:, 1:]
 
-        # Reshape patches to spatial grid (18 × 9), then crop to 16 rows.
-        # 18 is not divisible by 8; cropping to 16 (divisible by 2, 4, 8) ensures
-        # torch.chunk returns exactly 2/4/8 equal-sized stripes.
         patch_tokens = patch_tokens.view(B * T, self.patch_h, self.patch_w, -1)
-        patch_tokens = patch_tokens[:, :16, :, :]         # (B*T, 16, 9, 768)
+        patch_tokens = patch_tokens[:, :16, :, :]
 
-        # Multi-granularity stripe pooling
-        stripes_2 = torch.chunk(patch_tokens, 2, dim=1)   # 2 × (B*T, 8, 9, 768)
-        stripes_4 = torch.chunk(patch_tokens, 4, dim=1)   # 4 × (B*T, 4, 9, 768)
-        stripes_8 = torch.chunk(patch_tokens, 8, dim=1)   # 8 × (B*T, 2, 9, 768)
+        stripes_2 = torch.chunk(patch_tokens, 2, dim=1)
+        stripes_4 = torch.chunk(patch_tokens, 4, dim=1)
+        stripes_8 = torch.chunk(patch_tokens, 8, dim=1)
 
-        local_2 = [s.mean(dim=[1, 2]) for s in stripes_2]  # 2 × (B*T, 768)
-        local_4 = [s.mean(dim=[1, 2]) for s in stripes_4]  # 4 × (B*T, 768)
-        local_8 = [s.mean(dim=[1, 2]) for s in stripes_8]  # 8 × (B*T, 768)
+        local_2 = [s.mean(dim=[1, 2]) for s in stripes_2]
+        local_4 = [s.mean(dim=[1, 2]) for s in stripes_4]
+        local_8 = [s.mean(dim=[1, 2]) for s in stripes_8]
 
-        # Project each granularity
-        g        = self.global_proj(cls_token)                     # (B*T, 512)
-        locals_2 = [self.local_proj_2(f) for f in local_2]        # 2 × (B*T, 256)
-        locals_4 = [self.local_proj_4(f) for f in local_4]        # 4 × (B*T, 128)
-        locals_8 = [self.local_proj_8(f) for f in local_8]        # 8 × (B*T,  64)
+        g        = self.global_proj(cls_token)
+        locals_2 = [self.local_proj_2(f) for f in local_2]
+        locals_4 = [self.local_proj_4(f) for f in local_4]
+        locals_8 = [self.local_proj_8(f) for f in local_8]
 
-        # Concatenate → (B*T, 2048)
         feat = torch.cat([g] + locals_2 + locals_4 + locals_8, dim=1)
         feat = feat.view(B, T, -1)
 
-        # Stripe features for temporal stripe consistency loss (4-stripe, 128-dim)
         stripe_feats = torch.stack(locals_4, dim=1).view(B, T, 4, -1)
 
-        # Temporal Transformer (mask padded frames)
         pad_mask = torch.arange(T, device=x.device).unsqueeze(0) >= \
                    lengths.to(x.device).unsqueeze(1)
         feat = self.temporal_tf(feat, pad_mask=pad_mask)
 
-        # Bidirectional GRU
         packed  = nn.utils.rnn.pack_padded_sequence(
             feat, lengths.cpu(), batch_first=True, enforce_sorted=False
         )
         rnn_out, _ = self.rnn(packed)
         rnn_out, _ = nn.utils.rnn.pad_packed_sequence(rnn_out, batch_first=True)
 
-        # Mask padding positions
         max_len = rnn_out.size(1)
         mask = torch.arange(max_len, device=x.device).unsqueeze(0) < \
                lengths.unsqueeze(1).to(x.device)
 
-        # Attention pooling → embedding
         pooled    = self.attention(rnn_out, mask)
         embedding = self.embed_head(pooled)
         return F.normalize(embedding, dim=1), stripe_feats
 
 
 class TemporalAttention(nn.Module):
-    """Scalar dot-product attention over time steps to pool RNN outputs."""
     def __init__(self, hidden_dim):
         super().__init__()
         self.attn = nn.Linear(hidden_dim, 1)
 
     def forward(self, rnn_out, mask=None):
-        scores = self.attn(rnn_out).squeeze(-1)           # (B, T)
+        scores = self.attn(rnn_out).squeeze(-1)
         if mask is not None:
             scores = scores.masked_fill(~mask, float('-inf'))
-        weights = F.softmax(scores, dim=-1).unsqueeze(-1) # (B, T, 1)
-        return (weights * rnn_out).sum(dim=1)             # (B, H)
+        weights = F.softmax(scores, dim=-1).unsqueeze(-1)
+        return (weights * rnn_out).sum(dim=1)
 
 
 class ImprovedSeqToSeqReIDModel(nn.Module):
@@ -167,10 +140,8 @@ class ImprovedSeqToSeqReIDModel(nn.Module):
 
         if self.training:
             if self.classifier is not None:
-                # AMSoftmax: cosine similarity between normalized embedding and
-                # normalized classifier weights. Margin applied in the loss.
                 normed_w = F.normalize(self.classifier.weight, dim=1)
-                logits   = F.linear(embedding, normed_w)   # cosine sims in [-1, 1]
+                logits   = F.linear(embedding, normed_w)
             else:
                 logits = None
             return embedding, logits, stripe_feats
@@ -179,28 +150,6 @@ class ImprovedSeqToSeqReIDModel(nn.Module):
 
 
 class DetectThenReIDModel(nn.Module):
-    """
-    Single-model wrapper: YOLOv8 person detector → crop → ImprovedSeqToSeqReIDModel.
-
-    Designed for full-frame inputs (surveillance footage, IUSTPersonReID, etc.).
-    The detector is frozen and excluded from parameters() / state_dict().
-    Only the ReID model is trained / saved.
-
-    Args:
-        detector      : ultralytics YOLO model (frozen, not registered as submodule)
-        reid_model    : ImprovedSeqToSeqReIDModel
-        reid_transform: torchvision transform applied to each cropped PIL frame
-        conf_thresh   : YOLO confidence threshold for person detections
-        padding       : fractional bounding-box padding passed to detect_and_crop
-
-    Forward input:
-        pil_sequences : list[list[PIL.Image]] — outer list = batch, inner = frames
-        lengths       : (B,) LongTensor of actual sequence lengths
-
-    Forward output:
-        Same as ImprovedSeqToSeqReIDModel.forward — embeddings (B, embedding_dim)
-        or (embeddings, logits, stripe_feats) during training when num_classes is set.
-    """
 
     def __init__(self, detector, reid_model, reid_transform,
                  conf_thresh=0.4, padding=0.05):
@@ -209,8 +158,6 @@ class DetectThenReIDModel(nn.Module):
         self.reid_transform = reid_transform
         self.conf_thresh    = conf_thresh
         self.padding        = padding
-        # Bypass nn.Module.__setattr__ so the detector is NOT registered as a
-        # submodule — its weights stay out of parameters() and state_dict().
         object.__setattr__(self, '_detector', detector)
 
     @property
@@ -224,7 +171,6 @@ class DetectThenReIDModel(nn.Module):
                                padding=self.padding)
 
     def train(self, mode=True):
-        """Keep detector permanently in eval mode."""
         super().train(mode)
         if hasattr(self._detector, 'model'):
             self._detector.model.eval()
@@ -252,13 +198,9 @@ class TemporalStripeConsistencyLoss(nn.Module):
         super().__init__()
         self.margin       = margin
         self.lambda_inter = lambda_inter
-        # Only penalise frame pairs whose stripe similarity drops BELOW margin_intra.
-        # Pairs above the margin (natural temporal variation) are ignored, making
-        # the loss adaptive to challenging datasets like MARS.
         self.margin_intra = margin_intra
 
     def forward(self, stripe_feats, lengths):
-        # stripe_feats: (B, T, 4, D)
         B, T, S, D = stripe_feats.shape
         stripe_feats = F.normalize(stripe_feats, dim=-1)
 
@@ -270,17 +212,15 @@ class TemporalStripeConsistencyLoss(nn.Module):
             L = min(int(lengths[b].item()), T)
             if L < 2:
                 continue
-            feats = stripe_feats[b, :L]   # (L, S, D)
+            feats = stripe_feats[b, :L]
 
-            # Intra-stripe: only penalise frame pairs below margin_intra.
             for s in range(S):
                 sf  = feats[:, s, :]
                 sim = sf @ sf.T
                 off = ~torch.eye(L, dtype=torch.bool, device=sim.device)
                 intra_loss = intra_loss + F.relu(self.margin_intra - sim[off]).mean()
 
-            # Inter-stripe: different stripes in same frame should be dissimilar
-            sim_t = torch.bmm(feats, feats.transpose(1, 2))              # (L, S, S)
+            sim_t = torch.bmm(feats, feats.transpose(1, 2))
             off_s = ~torch.eye(S, dtype=torch.bool, device=feats.device)
             inter_mean = sim_t[:, off_s].mean()
             inter_loss = inter_loss + F.relu(inter_mean - self.margin)
@@ -306,17 +246,13 @@ class CombinedReIDLoss(nn.Module):
         self.lambda_stripe = lambda_stripe
         self.stripe_loss   = TemporalStripeConsistencyLoss(margin=0.3, lambda_inter=0.5,
                                                            margin_intra=0.5)
-        # AMSoftmax parameters
         self.am_scale  = am_scale
         self.am_margin = am_margin
 
     def forward(self, embeddings, labels, logits=None, stripe_feats=None, lengths=None):
         loss = 0.0
 
-        # 1. ID loss (AMSoftmax)
         if logits is not None:
-            # Subtract margin from the correct-class cosine similarity, then scale.
-            # Equivalent to CosFace: encourages a compact, well-separated hypersphere.
             one_hot = torch.zeros_like(logits)
             one_hot.scatter_(1, labels.unsqueeze(1), self.am_margin)
             logits_am = self.am_scale * (logits - one_hot)
@@ -325,7 +261,6 @@ class CombinedReIDLoss(nn.Module):
         else:
             id_loss = torch.tensor(0.0)
 
-        # 2. Triplet loss (batch-hard)
         dist = torch.cdist(embeddings, embeddings)
 
         eye      = torch.eye(len(labels), dtype=torch.bool, device=labels.device)
@@ -338,7 +273,6 @@ class CombinedReIDLoss(nn.Module):
         triplet_loss = F.relu(hardest_pos - hardest_neg + 0.3).mean()
         loss += triplet_loss
 
-        # 3. Circle loss
         sim = F.linear(F.normalize(embeddings), F.normalize(embeddings))
 
         pos_mask = mask_pos & ~eye
@@ -368,7 +302,6 @@ class CombinedReIDLoss(nn.Module):
 
         loss += self.lambda_circle * circle_loss
 
-        # 4. Temporal stripe consistency loss
         if stripe_feats is not None and lengths is not None:
             stripe_loss = self.stripe_loss(stripe_feats, lengths)
         else:

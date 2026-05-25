@@ -1,16 +1,3 @@
-"""
-One-shot YOLO person-crop preprocessing for IUSTPersonReID.
-
-IUST ships full 595x624 video frames. Training with DetectionCropTransform runs
-YOLO on every image every epoch, which is the dominant bottleneck. Running this
-script once materialises cropped copies on disk; iust-training.ipynb can then
-point IUST_ROOT at data/IUSTPersonReID_crops and use the standard (fast) pipeline.
-
-Usage:
-    python preprocess_iust.py
-
-Re-runs are resumable: existing crops are skipped.
-"""
 import os
 from PIL import Image
 from tqdm import tqdm
@@ -22,7 +9,7 @@ from helper_functions.utils import detect_and_crop
 SRC         = os.path.join('data', 'IUSTPersonReID')
 DST         = os.path.join('data', 'IUSTPersonReID_crops')
 SPLITS      = ['bounding_box_train', 'bounding_box_test', 'query']
-YOLO_WEIGHTS = 'yolov8n.pt'   # swap to yolov8s.pt for better recall on hard frames
+YOLO_WEIGHTS = 'yolov8n.pt'
 CONF_THRESH  = 0.4
 PADDING      = 0.05
 
